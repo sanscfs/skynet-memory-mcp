@@ -377,74 +377,179 @@ def _scroll_temporal(
     collection: str,
     event_after: Optional[str],
     event_before: Optional[str],
-    hard_cap: int = 5000,
+    limit: int = 200,
 ) -> list[dict]:
-    """Scroll one collection, return points whose event_timestamp
-    (fallback to ingestion `timestamp` with a ~ marker) falls in range.
+    """Scroll one collection for points whose event_timestamp falls in
+    the given range. Uses Qdrant's datetime payload index — range
+    filters are applied server-side in O(log n), not scanned via
+    Python compare in a scroll loop.
 
-    Filters at Qdrant level: must_not archived, must_not empty
-    timestamp. Date comparison happens in Python because Qdrant range
-    filters are numeric-only. Hard cap prevents a mistake on a huge
-    collection from OOMing the pod — if we ever hit it we'll paginate
-    the tool response instead.
+    Two passes per collection because a point may carry event_timestamp
+    (real event time) OR only the ingestion `timestamp` (for older
+    imports where event time was lost). The second pass widens
+    coverage for pre-backfill data at the cost of lower confidence —
+    each result flags which timestamp it matched on so the LLM can
+    decide whether to trust the date.
+
+    `limit` bounds pages returned per-collection. Production callers
+    set limit to the final output cap; the tool never returns more
+    than that per collection so nothing is scanned needlessly.
     """
     out: list[dict] = []
-    offset: Any = None
-    scanned = 0
-    while scanned < hard_cap:
+
+    # Base filter — archived / superseded / gemini-imports are all
+    # excluded from the main episodic/raw pool; we don't want to page
+    # through them. Adding the range clauses makes this an indexed
+    # lookup rather than a full scan.
+    base_must_not: list[dict] = [
+        {"key": "archived", "match": {"value": True}},
+    ]
+    base_must: list[dict] = [
+        {"is_empty": {"key": "superseded_by"}},
+    ]
+
+    def _range_clause(field: str) -> dict:
+        rng: dict[str, str] = {}
+        if event_after:
+            rng["gte"] = event_after
+        if event_before:
+            rng["lte"] = event_before
+        return {"key": field, "range": rng}
+
+    seen_ids: set[str] = set()
+
+    # Pass 1: real event_timestamp — highest confidence.
+    if event_after or event_before:
         body: dict[str, Any] = {
-            "limit": 500,
+            "limit": limit,
             "with_payload": True,
             "with_vector": False,
             "filter": {
-                "must_not": [
-                    {"key": "archived", "match": {"value": True}},
-                ],
-                "must": [
-                    {"is_empty": {"key": "superseded_by"}},
-                ],
+                "must": base_must + [_range_clause("event_timestamp")],
+                "must_not": base_must_not,
             },
         }
-        if offset is not None:
-            body["offset"] = offset
         r = _qdrant().post(f"/collections/{collection}/points/scroll", json=body)
         r.raise_for_status()
-        d = r.json().get("result", {}) or {}
-        pts = d.get("points", []) or []
-        if not pts:
-            break
-        for p in pts:
+        for p in r.json().get("result", {}).get("points", []) or []:
+            pid = str(p.get("id"))
+            if pid in seen_ids:
+                continue
+            seen_ids.add(pid)
             pl = p.get("payload") or {}
-            # Prefer event_timestamp; fall back to ingestion timestamp.
-            # The fallback is marked `is_ingestion_ts=True` on output so
-            # callers can tell "we know this happened on X" from "we
-            # just know this got imported on X".
-            ev = pl.get("event_timestamp")
-            is_ingestion = False
-            if not ev:
-                ev = pl.get("timestamp")
-                is_ingestion = True
-            if not ev:
-                continue
-            if event_after and ev < event_after:
-                continue
-            if event_before and ev > event_before:
-                continue
             text = pl.get("text") or pl.get("action") or pl.get("summary") or ""
             out.append({
-                "id": str(p.get("id")),
+                "id": pid,
                 "collection": collection,
-                "event_timestamp": ev,
-                "is_ingestion_timestamp": is_ingestion,
+                "event_timestamp": pl.get("event_timestamp"),
+                "is_ingestion_timestamp": False,
                 "source": pl.get("source"),
                 "category": pl.get("category"),
                 "text": (text if isinstance(text, str) else "")[:300],
             })
-        scanned += len(pts)
-        offset = d.get("next_page_offset")
-        if offset is None:
-            break
+
+        # Pass 2: fallback on ingestion `timestamp` for points lacking
+        # event_timestamp (common for google_takeout_gemini — 4140
+        # points where source dates were dropped by the ingestion
+        # pipeline pre-fix). Limit the extra rows so a date-range query
+        # doesn't get flooded with low-confidence gemini imports.
+        if len(out) < limit:
+            body = {
+                "limit": limit - len(out),
+                "with_payload": True,
+                "with_vector": False,
+                "filter": {
+                    "must": base_must + [
+                        _range_clause("timestamp"),
+                        {"is_empty": {"key": "event_timestamp"}},
+                    ],
+                    "must_not": base_must_not,
+                },
+            }
+            r = _qdrant().post(f"/collections/{collection}/points/scroll", json=body)
+            r.raise_for_status()
+            for p in r.json().get("result", {}).get("points", []) or []:
+                pid = str(p.get("id"))
+                if pid in seen_ids:
+                    continue
+                seen_ids.add(pid)
+                pl = p.get("payload") or {}
+                text = pl.get("text") or pl.get("action") or pl.get("summary") or ""
+                out.append({
+                    "id": pid,
+                    "collection": collection,
+                    "event_timestamp": pl.get("timestamp"),
+                    "is_ingestion_timestamp": True,
+                    "source": pl.get("source"),
+                    "category": pl.get("category"),
+                    "text": (text if isinstance(text, str) else "")[:300],
+                })
+    else:
+        # No range — used by memory_recent / memory_first. Scroll up to
+        # limit ordered-by-index (Qdrant doesn't sort, but scroll order
+        # is stable-per-collection so the caller can scan until limit
+        # and the result is still deterministic).
+        body = {
+            "limit": limit,
+            "with_payload": True,
+            "with_vector": False,
+            "filter": {
+                "must": base_must + [
+                    {"key": "event_timestamp", "range": {"gte": "1970-01-01T00:00:00Z"}},
+                ],
+                "must_not": base_must_not,
+            },
+        }
+        r = _qdrant().post(f"/collections/{collection}/points/scroll", json=body)
+        r.raise_for_status()
+        for p in r.json().get("result", {}).get("points", []) or []:
+            pl = p.get("payload") or {}
+            text = pl.get("text") or pl.get("action") or pl.get("summary") or ""
+            out.append({
+                "id": str(p.get("id")),
+                "collection": collection,
+                "event_timestamp": pl.get("event_timestamp"),
+                "is_ingestion_timestamp": False,
+                "source": pl.get("source"),
+                "category": pl.get("category"),
+                "text": (text if isinstance(text, str) else "")[:300],
+            })
+
     return out
+
+
+def _count_in_range(collection: str, event_after: Optional[str], event_before: Optional[str]) -> dict[str, int]:
+    """Exact count per timestamp-source (event vs ingestion) in range."""
+    rng: dict[str, str] = {}
+    if event_after:
+        rng["gte"] = event_after
+    if event_before:
+        rng["lte"] = event_before
+
+    def _count(flt: dict) -> int:
+        r = _qdrant().post(
+            f"/collections/{collection}/points/count",
+            json={"filter": flt, "exact": True},
+        )
+        r.raise_for_status()
+        return int(r.json().get("result", {}).get("count", 0))
+
+    by_event = _count({
+        "must": [
+            {"is_empty": {"key": "superseded_by"}},
+            {"key": "event_timestamp", "range": rng},
+        ],
+        "must_not": [{"key": "archived", "match": {"value": True}}],
+    })
+    by_ingestion = _count({
+        "must": [
+            {"is_empty": {"key": "superseded_by"}},
+            {"is_empty": {"key": "event_timestamp"}},
+            {"key": "timestamp", "range": rng},
+        ],
+        "must_not": [{"key": "archived", "match": {"value": True}}],
+    })
+    return {"event": by_event, "ingestion_fallback": by_ingestion, "total": by_event + by_ingestion}
 
 
 class MemoryByDateArgs(BaseModel):
@@ -499,35 +604,37 @@ def _tool_memory_by_date(args: MemoryByDateArgs) -> dict[str, Any]:
 
     merged: list[dict] = []
     errors: dict[str, str] = {}
+    counts: dict[str, dict[str, int]] = {}
     for col in args.collections:
         try:
-            merged.extend(_scroll_temporal(col, args.event_after, args.event_before))
+            merged.extend(_scroll_temporal(col, args.event_after, args.event_before, limit=args.limit))
+            counts[col] = _count_in_range(col, args.event_after, args.event_before)
         except httpx.HTTPError as e:
             errors[col] = str(e)[:200]
 
-    merged.sort(key=lambda p: p["event_timestamp"], reverse=True)
+    merged.sort(key=lambda p: p["event_timestamp"] or "", reverse=True)
     truncated = merged[: args.limit]
 
-    # Summary per collection tells the LLM whether the answer is a
-    # complete list or a truncated one.
-    by_col: dict[str, int] = {}
-    for p in merged:
-        by_col[p["collection"]] = by_col.get(p["collection"], 0) + 1
+    total_event = sum(c.get("event", 0) for c in counts.values())
+    total_fallback = sum(c.get("ingestion_fallback", 0) for c in counts.values())
 
     return {
         "event_after": args.event_after,
         "event_before": args.event_before,
-        "count_total_in_range": len(merged),
+        "count_total_in_range": total_event + total_fallback,
+        "count_with_real_event_timestamp": total_event,
+        "count_ingestion_fallback": total_fallback,
         "count_returned": len(truncated),
-        "by_collection": by_col,
+        "by_collection": counts,
         "results": truncated,
         "errors": errors,
         "hint": (
             "is_ingestion_timestamp=True means the date is when the "
             "point was IMPORTED, not when the described event happened "
-            "— common for google_takeout_gemini points where source HTML "
-            "had timestamps but the insight-extraction pipeline dropped "
-            "them. Treat those dates as lower-confidence."
+            "— common for google_takeout_gemini (4140 points). Treat "
+            "those dates as lower-confidence. If count_total_in_range "
+            "> count_returned, call again with a narrower range or "
+            "raise `limit` up to 50."
         ),
     }
 
@@ -546,12 +653,16 @@ class MemoryRecentArgs(BaseModel):
 def _tool_memory_recent(args: MemoryRecentArgs) -> dict[str, Any]:
     merged: list[dict] = []
     errors: dict[str, str] = {}
+    # Pull generous headroom per collection (3× target) so after the
+    # combined sort we still have N fresh points even if one collection
+    # dominates with near-future dates.
+    fetch = max(args.n * 3, args.n)
     for col in args.collections:
         try:
-            merged.extend(_scroll_temporal(col, None, None))
+            merged.extend(_scroll_temporal(col, None, None, limit=fetch))
         except httpx.HTTPError as e:
             errors[col] = str(e)[:200]
-    merged.sort(key=lambda p: p["event_timestamp"], reverse=True)
+    merged.sort(key=lambda p: p["event_timestamp"] or "", reverse=True)
     return {
         "count_scanned": len(merged),
         "count_returned": min(args.n, len(merged)),
@@ -574,17 +685,70 @@ class MemoryFirstArgs(BaseModel):
 def _tool_memory_first(args: MemoryFirstArgs) -> dict[str, Any]:
     merged: list[dict] = []
     errors: dict[str, str] = {}
+    fetch = max(args.n * 3, args.n)
     for col in args.collections:
         try:
-            merged.extend(_scroll_temporal(col, None, None))
+            merged.extend(_scroll_temporal(col, None, None, limit=fetch))
         except httpx.HTTPError as e:
             errors[col] = str(e)[:200]
-    merged.sort(key=lambda p: p["event_timestamp"])
+    merged.sort(key=lambda p: p["event_timestamp"] or "")
     return {
         "count_scanned": len(merged),
         "count_returned": min(args.n, len(merged)),
         "results": merged[: args.n],
         "errors": errors,
+    }
+
+
+class MemoryCoverageArgs(BaseModel):
+    event_after: Optional[str] = Field(
+        None,
+        description="Optional lower bound (ISO-8601). Omit to count everything below `event_before`.",
+    )
+    event_before: Optional[str] = Field(
+        None,
+        description="Optional upper bound (ISO-8601). Omit to count everything above `event_after`.",
+    )
+    collections: list[str] = Field(
+        default_factory=lambda: list(DEFAULT_TEMPORAL_COLLECTIONS),
+    )
+
+
+def _tool_memory_coverage(args: MemoryCoverageArgs) -> dict[str, Any]:
+    """Return exact counts per collection / timestamp-source in a date
+    range, WITHOUT fetching any point payloads.
+
+    Call this before memory_by_date when the expected answer could be
+    \"nothing from that far back\" — a zero count is a fast no-go that
+    avoids the LLM hallucinating from low-confidence fallback data.
+    Also surfaces the split between real event_timestamps and ingestion
+    fallbacks so callers can calibrate confidence.
+    """
+    totals: dict[str, int] = {"event": 0, "ingestion_fallback": 0, "total": 0}
+    by_col: dict[str, dict[str, int]] = {}
+    errors: dict[str, str] = {}
+    for col in args.collections:
+        try:
+            c = _count_in_range(col, args.event_after, args.event_before)
+            by_col[col] = c
+            for k, v in c.items():
+                totals[k] = totals.get(k, 0) + v
+        except httpx.HTTPError as e:
+            errors[col] = str(e)[:200]
+    return {
+        "event_after": args.event_after,
+        "event_before": args.event_before,
+        "totals": totals,
+        "by_collection": by_col,
+        "errors": errors,
+        "hint": (
+            "totals.event = points with a real event_timestamp in range; "
+            "totals.ingestion_fallback = points without event_timestamp "
+            "where the import date matches (lower confidence — date "
+            "tells when it was imported, not when it happened). Zero "
+            "`total` means the corpus has nothing for that range — do "
+            "not invent an answer."
+        ),
     }
 
 
@@ -652,6 +816,18 @@ TOOLS: dict[str, dict[str, Any]] = {
         ),
         "model": MemoryFirstArgs,
         "fn": _tool_memory_first,
+    },
+    "memory_coverage": {
+        "description": (
+            "Exact count of memory points in a date range, split by "
+            "real-event-timestamp vs ingestion-fallback. Call this "
+            "first when you suspect \"there might be nothing from that "
+            "date\" — a zero totals.total means the corpus genuinely "
+            "has no data for the range, so don't hallucinate an answer. "
+            "Cheap (no payload fetch, just indexed count)."
+        ),
+        "model": MemoryCoverageArgs,
+        "fn": _tool_memory_coverage,
     },
 }
 
