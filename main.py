@@ -48,13 +48,28 @@ IDENTITY_URL = os.getenv(
 ATLAS_URL = os.getenv(
     "ATLAS_URL", "http://skynet-rag-atlas.skynet-rag-atlas.svc:8080"
 ).rstrip("/")
+QDRANT_URL = os.getenv(
+    "QDRANT_URL", "http://qdrant-headless.qdrant.svc:6333"
+).rstrip("/")
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "45"))
 MAX_ITEMS_PER_BUCKET = int(os.getenv("MAX_ITEMS_PER_BUCKET", "3"))
+
+# Collections the temporal tools see by default. user_profile_raw holds
+# imported data (gemini, phone, git history, claude sessions) — where
+# date-anchored questions usually find their answer. skynet_episodic
+# holds live Matrix/task memory. skynet_knowledge is excluded because
+# it's deprecated (see project_skynet_knowledge_deleted.md).
+DEFAULT_TEMPORAL_COLLECTIONS = ["user_profile_raw", "skynet_episodic"]
+# Hard cap on points returned per tool call — temporal queries can easily
+# page through thousands of points, and LLM context isn't cheap. Tune
+# via env if a caller legitimately needs more.
+TEMPORAL_MAX_RESULTS = int(os.getenv("TEMPORAL_MAX_RESULTS", "50"))
 
 app = FastAPI(title="skynet-memory-mcp", version="0.1.0")
 
 _identity_client: httpx.Client | None = None
 _atlas_client: httpx.Client | None = None
+_qdrant_client: httpx.Client | None = None
 
 
 def _identity() -> httpx.Client:
@@ -69,6 +84,13 @@ def _atlas() -> httpx.Client:
     if _atlas_client is None:
         _atlas_client = httpx.Client(base_url=ATLAS_URL, timeout=REQUEST_TIMEOUT)
     return _atlas_client
+
+
+def _qdrant() -> httpx.Client:
+    global _qdrant_client
+    if _qdrant_client is None:
+        _qdrant_client = httpx.Client(base_url=QDRANT_URL, timeout=REQUEST_TIMEOUT)
+    return _qdrant_client
 
 
 # ---------------------------------------------------------------------------
@@ -334,6 +356,239 @@ def _tool_list_compression_stats(args: ListCompressionStatsArgs) -> dict[str, An
 
 
 # ---------------------------------------------------------------------------
+# Temporal tools: memory_by_date / memory_recent / memory_first
+# ---------------------------------------------------------------------------
+#
+# These tools bypass identity's vector scoring and query Qdrant directly
+# for time-anchored lookups. The LLM supplies absolute ISO dates it
+# parsed from the user's natural language ("що було 15 березня" at
+# today=2026-04-15 → after=2026-03-15, before=2026-03-16). That keeps
+# language parsing in the model where it's native, and the tool stays
+# dumb + deterministic.
+#
+# Qdrant range filter applies to numeric fields only, so we scroll with
+# a coarse must-filter (event_timestamp exists, not archived) and apply
+# the ISO string comparison in Python. ISO-8601 sorts lexically, so a
+# direct string compare is equivalent to a datetime compare without any
+# parsing — that's why event_timestamp is stored as a string everywhere.
+
+
+def _scroll_temporal(
+    collection: str,
+    event_after: Optional[str],
+    event_before: Optional[str],
+    hard_cap: int = 5000,
+) -> list[dict]:
+    """Scroll one collection, return points whose event_timestamp
+    (fallback to ingestion `timestamp` with a ~ marker) falls in range.
+
+    Filters at Qdrant level: must_not archived, must_not empty
+    timestamp. Date comparison happens in Python because Qdrant range
+    filters are numeric-only. Hard cap prevents a mistake on a huge
+    collection from OOMing the pod — if we ever hit it we'll paginate
+    the tool response instead.
+    """
+    out: list[dict] = []
+    offset: Any = None
+    scanned = 0
+    while scanned < hard_cap:
+        body: dict[str, Any] = {
+            "limit": 500,
+            "with_payload": True,
+            "with_vector": False,
+            "filter": {
+                "must_not": [
+                    {"key": "archived", "match": {"value": True}},
+                ],
+                "must": [
+                    {"is_empty": {"key": "superseded_by"}},
+                ],
+            },
+        }
+        if offset is not None:
+            body["offset"] = offset
+        r = _qdrant().post(f"/collections/{collection}/points/scroll", json=body)
+        r.raise_for_status()
+        d = r.json().get("result", {}) or {}
+        pts = d.get("points", []) or []
+        if not pts:
+            break
+        for p in pts:
+            pl = p.get("payload") or {}
+            # Prefer event_timestamp; fall back to ingestion timestamp.
+            # The fallback is marked `is_ingestion_ts=True` on output so
+            # callers can tell "we know this happened on X" from "we
+            # just know this got imported on X".
+            ev = pl.get("event_timestamp")
+            is_ingestion = False
+            if not ev:
+                ev = pl.get("timestamp")
+                is_ingestion = True
+            if not ev:
+                continue
+            if event_after and ev < event_after:
+                continue
+            if event_before and ev > event_before:
+                continue
+            text = pl.get("text") or pl.get("action") or pl.get("summary") or ""
+            out.append({
+                "id": str(p.get("id")),
+                "collection": collection,
+                "event_timestamp": ev,
+                "is_ingestion_timestamp": is_ingestion,
+                "source": pl.get("source"),
+                "category": pl.get("category"),
+                "text": (text if isinstance(text, str) else "")[:300],
+            })
+        scanned += len(pts)
+        offset = d.get("next_page_offset")
+        if offset is None:
+            break
+    return out
+
+
+class MemoryByDateArgs(BaseModel):
+    event_after: Optional[str] = Field(
+        None,
+        description=(
+            "Inclusive lower bound on event_timestamp, ISO-8601 "
+            "(e.g. \"2024-03-15T00:00:00\" or just \"2024-03-15\"). "
+            "Parse natural language yourself — current date is available "
+            "in your system context. Omit for open-ended past."
+        ),
+    )
+    event_before: Optional[str] = Field(
+        None,
+        description=(
+            "Inclusive upper bound on event_timestamp, ISO-8601. "
+            "For a single-day query use after=\"2024-03-15\" and "
+            "before=\"2024-03-16\" (range is [after, before] in ISO "
+            "lexical order). Omit for open-ended future."
+        ),
+    )
+    collections: list[str] = Field(
+        default_factory=lambda: list(DEFAULT_TEMPORAL_COLLECTIONS),
+        description=(
+            "Which Qdrant collections to scan. Defaults cover the two "
+            "that store dated memory: user_profile_raw (imported data — "
+            "gemini, phone, git, claude sessions) and skynet_episodic "
+            "(live matrix/task memory)."
+        ),
+    )
+    limit: int = Field(
+        20, ge=1, le=TEMPORAL_MAX_RESULTS,
+        description=(
+            "Max points to return, newest first. The tool already hard-caps "
+            "at TEMPORAL_MAX_RESULTS (50) to keep the response LLM-friendly; "
+            "raise only if you need exhaustive coverage."
+        ),
+    )
+
+
+def _tool_memory_by_date(args: MemoryByDateArgs) -> dict[str, Any]:
+    if not args.event_after and not args.event_before:
+        return {
+            "warning": (
+                "Neither event_after nor event_before was set — this "
+                "would return EVERY dated point. Use memory_recent for "
+                "chronological browsing; use this tool only when you "
+                "have at least one bound."
+            ),
+            "results": [],
+        }
+
+    merged: list[dict] = []
+    errors: dict[str, str] = {}
+    for col in args.collections:
+        try:
+            merged.extend(_scroll_temporal(col, args.event_after, args.event_before))
+        except httpx.HTTPError as e:
+            errors[col] = str(e)[:200]
+
+    merged.sort(key=lambda p: p["event_timestamp"], reverse=True)
+    truncated = merged[: args.limit]
+
+    # Summary per collection tells the LLM whether the answer is a
+    # complete list or a truncated one.
+    by_col: dict[str, int] = {}
+    for p in merged:
+        by_col[p["collection"]] = by_col.get(p["collection"], 0) + 1
+
+    return {
+        "event_after": args.event_after,
+        "event_before": args.event_before,
+        "count_total_in_range": len(merged),
+        "count_returned": len(truncated),
+        "by_collection": by_col,
+        "results": truncated,
+        "errors": errors,
+        "hint": (
+            "is_ingestion_timestamp=True means the date is when the "
+            "point was IMPORTED, not when the described event happened "
+            "— common for google_takeout_gemini points where source HTML "
+            "had timestamps but the insight-extraction pipeline dropped "
+            "them. Treat those dates as lower-confidence."
+        ),
+    }
+
+
+class MemoryRecentArgs(BaseModel):
+    n: int = Field(
+        10, ge=1, le=TEMPORAL_MAX_RESULTS,
+        description="How many most-recent points to return.",
+    )
+    collections: list[str] = Field(
+        default_factory=lambda: list(DEFAULT_TEMPORAL_COLLECTIONS),
+        description="Which Qdrant collections to scan.",
+    )
+
+
+def _tool_memory_recent(args: MemoryRecentArgs) -> dict[str, Any]:
+    merged: list[dict] = []
+    errors: dict[str, str] = {}
+    for col in args.collections:
+        try:
+            merged.extend(_scroll_temporal(col, None, None))
+        except httpx.HTTPError as e:
+            errors[col] = str(e)[:200]
+    merged.sort(key=lambda p: p["event_timestamp"], reverse=True)
+    return {
+        "count_scanned": len(merged),
+        "count_returned": min(args.n, len(merged)),
+        "results": merged[: args.n],
+        "errors": errors,
+    }
+
+
+class MemoryFirstArgs(BaseModel):
+    n: int = Field(
+        10, ge=1, le=TEMPORAL_MAX_RESULTS,
+        description="How many oldest points to return.",
+    )
+    collections: list[str] = Field(
+        default_factory=lambda: list(DEFAULT_TEMPORAL_COLLECTIONS),
+        description="Which Qdrant collections to scan.",
+    )
+
+
+def _tool_memory_first(args: MemoryFirstArgs) -> dict[str, Any]:
+    merged: list[dict] = []
+    errors: dict[str, str] = {}
+    for col in args.collections:
+        try:
+            merged.extend(_scroll_temporal(col, None, None))
+        except httpx.HTTPError as e:
+            errors[col] = str(e)[:200]
+    merged.sort(key=lambda p: p["event_timestamp"])
+    return {
+        "count_scanned": len(merged),
+        "count_returned": min(args.n, len(merged)),
+        "results": merged[: args.n],
+        "errors": errors,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Tool registry
 # ---------------------------------------------------------------------------
 
@@ -362,6 +617,41 @@ TOOLS: dict[str, dict[str, Any]] = {
         ),
         "model": ListCompressionStatsArgs,
         "fn": _tool_list_compression_stats,
+    },
+    "memory_by_date": {
+        "description": (
+            "Retrieve memory points whose event_timestamp falls in a "
+            "date range, newest first. Use this for \"що було 15 "
+            "березня?\", \"що я робив минулого тижня?\", \"мої коміти "
+            "за квітень\" — any question where the user anchors on a "
+            "specific time, not a topic. Parse the natural-language date "
+            "YOURSELF (current date is in your system context) and pass "
+            "ISO-8601 strings. Returns only points that are actually "
+            "dated — see is_ingestion_timestamp on each result to tell "
+            "\"known to have happened then\" from \"known to have been "
+            "imported then\"."
+        ),
+        "model": MemoryByDateArgs,
+        "fn": _tool_memory_by_date,
+    },
+    "memory_recent": {
+        "description": (
+            "Return the N most recent memory points across dated "
+            "collections. Use for \"що я останнім часом робив?\", "
+            "\"останні події\", or to check the freshness of the corpus "
+            "before answering a recency-sensitive question."
+        ),
+        "model": MemoryRecentArgs,
+        "fn": _tool_memory_recent,
+    },
+    "memory_first": {
+        "description": (
+            "Return the N oldest memory points across dated collections. "
+            "Use for \"з чого все починалось?\" or to spot-check how "
+            "far back the imported history actually reaches."
+        ),
+        "model": MemoryFirstArgs,
+        "fn": _tool_memory_first,
     },
 }
 
