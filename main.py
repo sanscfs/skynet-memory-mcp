@@ -35,12 +35,12 @@ import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from skynet_core.logging import setup_logging
-from skynet_core.tracing import setup_tracing, get_tracer
+from skynet_core.tracing import setup_tracing
+from skynet_mcp import ToolRegistry, mount_mcp
 
 log = setup_logging("memory-mcp")
 
 setup_tracing("memory-mcp", instrumentors=["fastapi", "httpx"])
-tracer = get_tracer("memory-mcp")
 
 IDENTITY_URL = os.getenv(
     "IDENTITY_URL", "http://skynet-identity.skynet-identity.svc:8080"
@@ -66,6 +66,7 @@ DEFAULT_TEMPORAL_COLLECTIONS = ["user_profile_raw", "skynet_episodic"]
 TEMPORAL_MAX_RESULTS = int(os.getenv("TEMPORAL_MAX_RESULTS", "50"))
 
 app = FastAPI(title="skynet-memory-mcp", version="0.1.0")
+registry = ToolRegistry()
 
 _identity_client: httpx.Client | None = None
 _atlas_client: httpx.Client | None = None
@@ -182,8 +183,23 @@ def _previews_by_id(bucket: list[dict]) -> dict[str, str]:
     return out
 
 
-def _tool_retrieval_debug(args: RetrievalDebugArgs) -> dict[str, Any]:
-    payload = {
+@registry.tool(
+    name="retrieval_debug",
+    description=(
+        "Replay a query through skynet-identity with debug=True and "
+        "return a pruned view of per-candidate score components "
+        "(vec, access, recency, graph, logical_decay, compression_boost, "
+        "clique_boost, ...). Use this whenever a user reports "
+        "\"Skynet doesn't remember X\" or \"the reply referenced the "
+        "wrong memory\". Answers the question: why did this candidate "
+        "win/lose? Returns top 3 per bucket (episodic, knowledge, raw) "
+        "plus a one-paragraph diagnosis."
+    ),
+    schema=RetrievalDebugArgs.model_json_schema(),
+)
+def _tool_retrieval_debug(**kwargs: Any) -> dict[str, Any]:
+    args = RetrievalDebugArgs(**kwargs)
+    payload: dict[str, Any] = {
         "query": args.query,
         "debug": True,
         "top_k": args.top_k,
@@ -210,7 +226,7 @@ def _tool_retrieval_debug(args: RetrievalDebugArgs) -> dict[str, Any]:
 
     # Build id->preview lookup from the full-content buckets so the
     # agent sees what each scored point actually contains.
-    previews = {}
+    previews: dict[str, str] = {}
     for key in ("episodic_memories", "knowledge", "raw_memories"):
         previews.update(_previews_by_id(body.get(key, []) or []))
 
@@ -301,7 +317,19 @@ class ListCompressionStatsArgs(BaseModel):
     )
 
 
-def _tool_list_compression_stats(args: ListCompressionStatsArgs) -> dict[str, Any]:
+@registry.tool(
+    name="list_compression_stats",
+    description=(
+        "Return a compact summary of memory compression health for a "
+        "Qdrant collection: compression_level histogram (are we "
+        "consolidating enough?) + cliques under eviction pressure. "
+        "Use this when asking \"is memory healthy?\" or before "
+        "triggering a manual consolidation DAG."
+    ),
+    schema=ListCompressionStatsArgs.model_json_schema(),
+)
+def _tool_list_compression_stats(**kwargs: Any) -> dict[str, Any]:
+    args = ListCompressionStatsArgs(**kwargs)
     out: dict[str, Any] = {"collection": args.collection}
 
     try:
@@ -590,7 +618,24 @@ class MemoryByDateArgs(BaseModel):
     )
 
 
-def _tool_memory_by_date(args: MemoryByDateArgs) -> dict[str, Any]:
+@registry.tool(
+    name="memory_by_date",
+    description=(
+        "Retrieve memory points whose event_timestamp falls in a "
+        "date range, newest first. Use this for \"що було 15 "
+        "березня?\", \"що я робив минулого тижня?\", \"мої коміти "
+        "за квітень\" — any question where the user anchors on a "
+        "specific time, not a topic. Parse the natural-language date "
+        "YOURSELF (current date is in your system context) and pass "
+        "ISO-8601 strings. Returns only points that are actually "
+        "dated — see is_ingestion_timestamp on each result to tell "
+        "\"known to have happened then\" from \"known to have been "
+        "imported then\"."
+    ),
+    schema=MemoryByDateArgs.model_json_schema(),
+)
+def _tool_memory_by_date(**kwargs: Any) -> dict[str, Any]:
+    args = MemoryByDateArgs(**kwargs)
     if not args.event_after and not args.event_before:
         return {
             "warning": (
@@ -650,7 +695,18 @@ class MemoryRecentArgs(BaseModel):
     )
 
 
-def _tool_memory_recent(args: MemoryRecentArgs) -> dict[str, Any]:
+@registry.tool(
+    name="memory_recent",
+    description=(
+        "Return the N most recent memory points across dated "
+        "collections. Use for \"що я останнім часом робив?\", "
+        "\"останні події\", or to check the freshness of the corpus "
+        "before answering a recency-sensitive question."
+    ),
+    schema=MemoryRecentArgs.model_json_schema(),
+)
+def _tool_memory_recent(**kwargs: Any) -> dict[str, Any]:
+    args = MemoryRecentArgs(**kwargs)
     merged: list[dict] = []
     errors: dict[str, str] = {}
     # Pull generous headroom per collection (3× target) so after the
@@ -682,7 +738,17 @@ class MemoryFirstArgs(BaseModel):
     )
 
 
-def _tool_memory_first(args: MemoryFirstArgs) -> dict[str, Any]:
+@registry.tool(
+    name="memory_first",
+    description=(
+        "Return the N oldest memory points across dated collections. "
+        "Use for \"з чого все починалось?\" or to spot-check how "
+        "far back the imported history actually reaches."
+    ),
+    schema=MemoryFirstArgs.model_json_schema(),
+)
+def _tool_memory_first(**kwargs: Any) -> dict[str, Any]:
+    args = MemoryFirstArgs(**kwargs)
     merged: list[dict] = []
     errors: dict[str, str] = {}
     fetch = max(args.n * 3, args.n)
@@ -714,16 +780,20 @@ class MemoryCoverageArgs(BaseModel):
     )
 
 
-def _tool_memory_coverage(args: MemoryCoverageArgs) -> dict[str, Any]:
-    """Return exact counts per collection / timestamp-source in a date
-    range, WITHOUT fetching any point payloads.
-
-    Call this before memory_by_date when the expected answer could be
-    \"nothing from that far back\" — a zero count is a fast no-go that
-    avoids the LLM hallucinating from low-confidence fallback data.
-    Also surfaces the split between real event_timestamps and ingestion
-    fallbacks so callers can calibrate confidence.
-    """
+@registry.tool(
+    name="memory_coverage",
+    description=(
+        "Exact count of memory points in a date range, split by "
+        "real-event-timestamp vs ingestion-fallback. Call this "
+        "first when you suspect \"there might be nothing from that "
+        "date\" — a zero totals.total means the corpus genuinely "
+        "has no data for the range, so don't hallucinate an answer. "
+        "Cheap (no payload fetch, just indexed count)."
+    ),
+    schema=MemoryCoverageArgs.model_json_schema(),
+)
+def _tool_memory_coverage(**kwargs: Any) -> dict[str, Any]:
+    args = MemoryCoverageArgs(**kwargs)
     totals: dict[str, int] = {"event": 0, "ingestion_fallback": 0, "total": 0}
     by_col: dict[str, dict[str, int]] = {}
     errors: dict[str, str] = {}
@@ -753,146 +823,21 @@ def _tool_memory_coverage(args: MemoryCoverageArgs) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Tool registry
+# Mount MCP routes (GET /tools, POST /tools/{name}/call)
 # ---------------------------------------------------------------------------
 
-TOOLS: dict[str, dict[str, Any]] = {
-    "retrieval_debug": {
-        "description": (
-            "Replay a query through skynet-identity with debug=True and "
-            "return a pruned view of per-candidate score components "
-            "(vec, access, recency, graph, logical_decay, compression_boost, "
-            "clique_boost, ...). Use this whenever a user reports "
-            "\"Skynet doesn't remember X\" or \"the reply referenced the "
-            "wrong memory\". Answers the question: why did this candidate "
-            "win/lose? Returns top 3 per bucket (episodic, knowledge, raw) "
-            "plus a one-paragraph diagnosis."
-        ),
-        "model": RetrievalDebugArgs,
-        "fn": _tool_retrieval_debug,
-    },
-    "list_compression_stats": {
-        "description": (
-            "Return a compact summary of memory compression health for a "
-            "Qdrant collection: compression_level histogram (are we "
-            "consolidating enough?) + cliques under eviction pressure. "
-            "Use this when asking \"is memory healthy?\" or before "
-            "triggering a manual consolidation DAG."
-        ),
-        "model": ListCompressionStatsArgs,
-        "fn": _tool_list_compression_stats,
-    },
-    "memory_by_date": {
-        "description": (
-            "Retrieve memory points whose event_timestamp falls in a "
-            "date range, newest first. Use this for \"що було 15 "
-            "березня?\", \"що я робив минулого тижня?\", \"мої коміти "
-            "за квітень\" — any question where the user anchors on a "
-            "specific time, not a topic. Parse the natural-language date "
-            "YOURSELF (current date is in your system context) and pass "
-            "ISO-8601 strings. Returns only points that are actually "
-            "dated — see is_ingestion_timestamp on each result to tell "
-            "\"known to have happened then\" from \"known to have been "
-            "imported then\"."
-        ),
-        "model": MemoryByDateArgs,
-        "fn": _tool_memory_by_date,
-    },
-    "memory_recent": {
-        "description": (
-            "Return the N most recent memory points across dated "
-            "collections. Use for \"що я останнім часом робив?\", "
-            "\"останні події\", or to check the freshness of the corpus "
-            "before answering a recency-sensitive question."
-        ),
-        "model": MemoryRecentArgs,
-        "fn": _tool_memory_recent,
-    },
-    "memory_first": {
-        "description": (
-            "Return the N oldest memory points across dated collections. "
-            "Use for \"з чого все починалось?\" or to spot-check how "
-            "far back the imported history actually reaches."
-        ),
-        "model": MemoryFirstArgs,
-        "fn": _tool_memory_first,
-    },
-    "memory_coverage": {
-        "description": (
-            "Exact count of memory points in a date range, split by "
-            "real-event-timestamp vs ingestion-fallback. Call this "
-            "first when you suspect \"there might be nothing from that "
-            "date\" — a zero totals.total means the corpus genuinely "
-            "has no data for the range, so don't hallucinate an answer. "
-            "Cheap (no payload fetch, just indexed count)."
-        ),
-        "model": MemoryCoverageArgs,
-        "fn": _tool_memory_coverage,
-    },
-}
+mount_mcp(app, registry)
 
 
-def _tool_manifest() -> dict[str, Any]:
-    tools = []
-    for name, spec in TOOLS.items():
-        model: type[BaseModel] = spec["model"]
-        tools.append(
-            {
-                "name": name,
-                "description": spec["description"],
-                "inputSchema": model.model_json_schema(),
-            }
-        )
-    return {"tools": tools}
-
-
-@app.get("/tools")
-def list_tools() -> dict[str, Any]:
-    return _tool_manifest()
-
-
-class ToolCallRequest(BaseModel):
-    arguments: dict[str, Any] = Field(default_factory=dict)
-
-
-@app.post("/tools/{name}/call")
-def call_tool(name: str, req: ToolCallRequest) -> dict[str, Any]:
-    spec = TOOLS.get(name)
-    if spec is None:
-        raise HTTPException(status_code=404, detail=f"unknown tool: {name}")
-    model: type[BaseModel] = spec["model"]
-    try:
-        parsed = model(**(req.arguments or {}))
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=422, detail=f"invalid arguments: {e}") from e
-    with tracer.start_as_current_span(f"tool_{name}") as span:
-        span.set_attribute("tool.name", name)
-        if hasattr(parsed, "query"):
-            span.set_attribute("tool.query", str(parsed.query)[:200])
-        if hasattr(parsed, "collection"):
-            span.set_attribute("tool.collection", parsed.collection)
-        try:
-            result = spec["fn"](parsed)
-            return {"result": result}
-        except httpx.HTTPStatusError as e:
-            span.record_exception(e)
-            log.warning("upstream error for %s: %s", name, e.response.text[:500])
-            raise HTTPException(
-                status_code=502,
-                detail=f"upstream {e.response.status_code}: {e.response.text[:200]}",
-            ) from e
-        except Exception as e:  # noqa: BLE001
-            span.record_exception(e)
-            log.exception("tool %s failed", name)
-            raise HTTPException(status_code=500, detail=str(e)) from e
-
-
+# ---------------------------------------------------------------------------
 # Convenience endpoints for curl debugging.
+# ---------------------------------------------------------------------------
+
 @app.post("/retrieval_debug")
 def ep_retrieval_debug(args: RetrievalDebugArgs) -> dict[str, Any]:
-    return {"result": _tool_retrieval_debug(args)}
+    return {"result": _tool_retrieval_debug(**args.model_dump())}
 
 
 @app.get("/compression_stats")
 def ep_compression_stats(collection: str = "user_profile_raw") -> dict[str, Any]:
-    return {"result": _tool_list_compression_stats(ListCompressionStatsArgs(collection=collection))}
+    return {"result": _tool_list_compression_stats(collection=collection)}
