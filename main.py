@@ -29,18 +29,20 @@ Environment variables:
 from __future__ import annotations
 
 import os
-from typing import Any, Optional
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator, Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from skynet_core.logging import setup_logging
-from skynet_core.tracing import setup_tracing, get_tracer
+from skynet_core.tracing import setup_tracing
+from skynet_mcp import ToolRegistry, mount_mcp
+from skynet_qdrant import AsyncQdrantClient
 
 log = setup_logging("memory-mcp")
 
 setup_tracing("memory-mcp", instrumentors=["fastapi", "httpx"])
-tracer = get_tracer("memory-mcp")
 
 IDENTITY_URL = os.getenv(
     "IDENTITY_URL", "http://skynet-identity.skynet-identity.svc:8080"
@@ -65,11 +67,25 @@ DEFAULT_TEMPORAL_COLLECTIONS = ["user_profile_raw", "skynet_episodic"]
 # via env if a caller legitimately needs more.
 TEMPORAL_MAX_RESULTS = int(os.getenv("TEMPORAL_MAX_RESULTS", "50"))
 
-app = FastAPI(title="skynet-memory-mcp", version="0.1.0")
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Close the shared AsyncQdrantClient on shutdown to avoid
+    'Unclosed client session' warnings in logs."""
+    try:
+        yield
+    finally:
+        global _qdrant_client
+        if _qdrant_client is not None:
+            await _qdrant_client.close()
+            _qdrant_client = None
+
+
+app = FastAPI(title="skynet-memory-mcp", version="0.1.0", lifespan=lifespan)
+registry = ToolRegistry()
 
 _identity_client: httpx.Client | None = None
 _atlas_client: httpx.Client | None = None
-_qdrant_client: httpx.Client | None = None
+_qdrant_client: AsyncQdrantClient | None = None
 
 
 def _identity() -> httpx.Client:
@@ -86,10 +102,16 @@ def _atlas() -> httpx.Client:
     return _atlas_client
 
 
-def _qdrant() -> httpx.Client:
+def _qdrant() -> AsyncQdrantClient:
+    """Lazily-instantiated shared Qdrant client.
+
+    Temporal tools use :meth:`AsyncQdrantClient.scroll` / ``count`` (via
+    ``skynet_qdrant``) for everything they need. The lib gives us an
+    httpx.AsyncClient underneath pooled across calls.
+    """
     global _qdrant_client
     if _qdrant_client is None:
-        _qdrant_client = httpx.Client(base_url=QDRANT_URL, timeout=REQUEST_TIMEOUT)
+        _qdrant_client = AsyncQdrantClient(url=QDRANT_URL, timeout=REQUEST_TIMEOUT)
     return _qdrant_client
 
 
@@ -182,8 +204,23 @@ def _previews_by_id(bucket: list[dict]) -> dict[str, str]:
     return out
 
 
-def _tool_retrieval_debug(args: RetrievalDebugArgs) -> dict[str, Any]:
-    payload = {
+@registry.tool(
+    name="retrieval_debug",
+    description=(
+        "Replay a query through skynet-identity with debug=True and "
+        "return a pruned view of per-candidate score components "
+        "(vec, access, recency, graph, logical_decay, compression_boost, "
+        "clique_boost, ...). Use this whenever a user reports "
+        "\"Skynet doesn't remember X\" or \"the reply referenced the "
+        "wrong memory\". Answers the question: why did this candidate "
+        "win/lose? Returns top 3 per bucket (episodic, knowledge, raw) "
+        "plus a one-paragraph diagnosis."
+    ),
+    schema=RetrievalDebugArgs.model_json_schema(),
+)
+def _tool_retrieval_debug(**kwargs: Any) -> dict[str, Any]:
+    args = RetrievalDebugArgs(**kwargs)
+    payload: dict[str, Any] = {
         "query": args.query,
         "debug": True,
         "top_k": args.top_k,
@@ -210,7 +247,7 @@ def _tool_retrieval_debug(args: RetrievalDebugArgs) -> dict[str, Any]:
 
     # Build id->preview lookup from the full-content buckets so the
     # agent sees what each scored point actually contains.
-    previews = {}
+    previews: dict[str, str] = {}
     for key in ("episodic_memories", "knowledge", "raw_memories"):
         previews.update(_previews_by_id(body.get(key, []) or []))
 
@@ -301,7 +338,19 @@ class ListCompressionStatsArgs(BaseModel):
     )
 
 
-def _tool_list_compression_stats(args: ListCompressionStatsArgs) -> dict[str, Any]:
+@registry.tool(
+    name="list_compression_stats",
+    description=(
+        "Return a compact summary of memory compression health for a "
+        "Qdrant collection: compression_level histogram (are we "
+        "consolidating enough?) + cliques under eviction pressure. "
+        "Use this when asking \"is memory healthy?\" or before "
+        "triggering a manual consolidation DAG."
+    ),
+    schema=ListCompressionStatsArgs.model_json_schema(),
+)
+def _tool_list_compression_stats(**kwargs: Any) -> dict[str, Any]:
+    args = ListCompressionStatsArgs(**kwargs)
     out: dict[str, Any] = {"collection": args.collection}
 
     try:
@@ -373,7 +422,7 @@ def _tool_list_compression_stats(args: ListCompressionStatsArgs) -> dict[str, An
 # parsing — that's why event_timestamp is stored as a string everywhere.
 
 
-def _scroll_temporal(
+async def _scroll_temporal(
     collection: str,
     event_after: Optional[str],
     event_before: Optional[str],
@@ -416,22 +465,22 @@ def _scroll_temporal(
             rng["lte"] = event_before
         return {"key": field, "range": rng}
 
+    client = _qdrant()
     seen_ids: set[str] = set()
 
     # Pass 1: real event_timestamp — highest confidence.
     if event_after or event_before:
-        body: dict[str, Any] = {
-            "limit": limit,
-            "with_payload": True,
-            "with_vector": False,
-            "filter": {
+        points, _ = await client.scroll(
+            collection,
+            limit=limit,
+            filter={
                 "must": base_must + [_range_clause("event_timestamp")],
                 "must_not": base_must_not,
             },
-        }
-        r = _qdrant().post(f"/collections/{collection}/points/scroll", json=body)
-        r.raise_for_status()
-        for p in r.json().get("result", {}).get("points", []) or []:
+            with_payload=True,
+            with_vector=False,
+        )
+        for p in points:
             pid = str(p.get("id"))
             if pid in seen_ids:
                 continue
@@ -454,21 +503,20 @@ def _scroll_temporal(
         # pipeline pre-fix). Limit the extra rows so a date-range query
         # doesn't get flooded with low-confidence gemini imports.
         if len(out) < limit:
-            body = {
-                "limit": limit - len(out),
-                "with_payload": True,
-                "with_vector": False,
-                "filter": {
+            points, _ = await client.scroll(
+                collection,
+                limit=limit - len(out),
+                filter={
                     "must": base_must + [
                         _range_clause("timestamp"),
                         {"is_empty": {"key": "event_timestamp"}},
                     ],
                     "must_not": base_must_not,
                 },
-            }
-            r = _qdrant().post(f"/collections/{collection}/points/scroll", json=body)
-            r.raise_for_status()
-            for p in r.json().get("result", {}).get("points", []) or []:
+                with_payload=True,
+                with_vector=False,
+            )
+            for p in points:
                 pid = str(p.get("id"))
                 if pid in seen_ids:
                     continue
@@ -489,20 +537,19 @@ def _scroll_temporal(
         # limit ordered-by-index (Qdrant doesn't sort, but scroll order
         # is stable-per-collection so the caller can scan until limit
         # and the result is still deterministic).
-        body = {
-            "limit": limit,
-            "with_payload": True,
-            "with_vector": False,
-            "filter": {
+        points, _ = await client.scroll(
+            collection,
+            limit=limit,
+            filter={
                 "must": base_must + [
                     {"key": "event_timestamp", "range": {"gte": "1970-01-01T00:00:00Z"}},
                 ],
                 "must_not": base_must_not,
             },
-        }
-        r = _qdrant().post(f"/collections/{collection}/points/scroll", json=body)
-        r.raise_for_status()
-        for p in r.json().get("result", {}).get("points", []) or []:
+            with_payload=True,
+            with_vector=False,
+        )
+        for p in points:
             pl = p.get("payload") or {}
             text = pl.get("text") or pl.get("action") or pl.get("summary") or ""
             out.append({
@@ -518,7 +565,9 @@ def _scroll_temporal(
     return out
 
 
-def _count_in_range(collection: str, event_after: Optional[str], event_before: Optional[str]) -> dict[str, int]:
+async def _count_in_range(
+    collection: str, event_after: Optional[str], event_before: Optional[str]
+) -> dict[str, int]:
     """Exact count per timestamp-source (event vs ingestion) in range."""
     rng: dict[str, str] = {}
     if event_after:
@@ -526,30 +575,34 @@ def _count_in_range(collection: str, event_after: Optional[str], event_before: O
     if event_before:
         rng["lte"] = event_before
 
-    def _count(flt: dict) -> int:
-        r = _qdrant().post(
-            f"/collections/{collection}/points/count",
-            json={"filter": flt, "exact": True},
-        )
-        r.raise_for_status()
-        return int(r.json().get("result", {}).get("count", 0))
+    client = _qdrant()
 
-    by_event = _count({
-        "must": [
-            {"is_empty": {"key": "superseded_by"}},
-            {"key": "event_timestamp", "range": rng},
-        ],
-        "must_not": [{"key": "archived", "match": {"value": True}}],
-    })
-    by_ingestion = _count({
-        "must": [
-            {"is_empty": {"key": "superseded_by"}},
-            {"is_empty": {"key": "event_timestamp"}},
-            {"key": "timestamp", "range": rng},
-        ],
-        "must_not": [{"key": "archived", "match": {"value": True}}],
-    })
-    return {"event": by_event, "ingestion_fallback": by_ingestion, "total": by_event + by_ingestion}
+    by_event = await client.count(
+        collection,
+        filter={
+            "must": [
+                {"is_empty": {"key": "superseded_by"}},
+                {"key": "event_timestamp", "range": rng},
+            ],
+            "must_not": [{"key": "archived", "match": {"value": True}}],
+        },
+    )
+    by_ingestion = await client.count(
+        collection,
+        filter={
+            "must": [
+                {"is_empty": {"key": "superseded_by"}},
+                {"is_empty": {"key": "event_timestamp"}},
+                {"key": "timestamp", "range": rng},
+            ],
+            "must_not": [{"key": "archived", "match": {"value": True}}],
+        },
+    )
+    return {
+        "event": by_event,
+        "ingestion_fallback": by_ingestion,
+        "total": by_event + by_ingestion,
+    }
 
 
 class MemoryByDateArgs(BaseModel):
@@ -590,7 +643,24 @@ class MemoryByDateArgs(BaseModel):
     )
 
 
-def _tool_memory_by_date(args: MemoryByDateArgs) -> dict[str, Any]:
+@registry.tool(
+    name="memory_by_date",
+    description=(
+        "Retrieve memory points whose event_timestamp falls in a "
+        "date range, newest first. Use this for \"що було 15 "
+        "березня?\", \"що я робив минулого тижня?\", \"мої коміти "
+        "за квітень\" — any question where the user anchors on a "
+        "specific time, not a topic. Parse the natural-language date "
+        "YOURSELF (current date is in your system context) and pass "
+        "ISO-8601 strings. Returns only points that are actually "
+        "dated — see is_ingestion_timestamp on each result to tell "
+        "\"known to have happened then\" from \"known to have been "
+        "imported then\"."
+    ),
+    schema=MemoryByDateArgs.model_json_schema(),
+)
+async def _tool_memory_by_date(**kwargs: Any) -> dict[str, Any]:
+    args = MemoryByDateArgs(**kwargs)
     if not args.event_after and not args.event_before:
         return {
             "warning": (
@@ -607,8 +677,14 @@ def _tool_memory_by_date(args: MemoryByDateArgs) -> dict[str, Any]:
     counts: dict[str, dict[str, int]] = {}
     for col in args.collections:
         try:
-            merged.extend(_scroll_temporal(col, args.event_after, args.event_before, limit=args.limit))
-            counts[col] = _count_in_range(col, args.event_after, args.event_before)
+            merged.extend(
+                await _scroll_temporal(
+                    col, args.event_after, args.event_before, limit=args.limit
+                )
+            )
+            counts[col] = await _count_in_range(
+                col, args.event_after, args.event_before
+            )
         except httpx.HTTPError as e:
             errors[col] = str(e)[:200]
 
@@ -650,7 +726,18 @@ class MemoryRecentArgs(BaseModel):
     )
 
 
-def _tool_memory_recent(args: MemoryRecentArgs) -> dict[str, Any]:
+@registry.tool(
+    name="memory_recent",
+    description=(
+        "Return the N most recent memory points across dated "
+        "collections. Use for \"що я останнім часом робив?\", "
+        "\"останні події\", or to check the freshness of the corpus "
+        "before answering a recency-sensitive question."
+    ),
+    schema=MemoryRecentArgs.model_json_schema(),
+)
+async def _tool_memory_recent(**kwargs: Any) -> dict[str, Any]:
+    args = MemoryRecentArgs(**kwargs)
     merged: list[dict] = []
     errors: dict[str, str] = {}
     # Pull generous headroom per collection (3× target) so after the
@@ -659,7 +746,7 @@ def _tool_memory_recent(args: MemoryRecentArgs) -> dict[str, Any]:
     fetch = max(args.n * 3, args.n)
     for col in args.collections:
         try:
-            merged.extend(_scroll_temporal(col, None, None, limit=fetch))
+            merged.extend(await _scroll_temporal(col, None, None, limit=fetch))
         except httpx.HTTPError as e:
             errors[col] = str(e)[:200]
     merged.sort(key=lambda p: p["event_timestamp"] or "", reverse=True)
@@ -682,13 +769,23 @@ class MemoryFirstArgs(BaseModel):
     )
 
 
-def _tool_memory_first(args: MemoryFirstArgs) -> dict[str, Any]:
+@registry.tool(
+    name="memory_first",
+    description=(
+        "Return the N oldest memory points across dated collections. "
+        "Use for \"з чого все починалось?\" or to spot-check how "
+        "far back the imported history actually reaches."
+    ),
+    schema=MemoryFirstArgs.model_json_schema(),
+)
+async def _tool_memory_first(**kwargs: Any) -> dict[str, Any]:
+    args = MemoryFirstArgs(**kwargs)
     merged: list[dict] = []
     errors: dict[str, str] = {}
     fetch = max(args.n * 3, args.n)
     for col in args.collections:
         try:
-            merged.extend(_scroll_temporal(col, None, None, limit=fetch))
+            merged.extend(await _scroll_temporal(col, None, None, limit=fetch))
         except httpx.HTTPError as e:
             errors[col] = str(e)[:200]
     merged.sort(key=lambda p: p["event_timestamp"] or "")
@@ -714,22 +811,26 @@ class MemoryCoverageArgs(BaseModel):
     )
 
 
-def _tool_memory_coverage(args: MemoryCoverageArgs) -> dict[str, Any]:
-    """Return exact counts per collection / timestamp-source in a date
-    range, WITHOUT fetching any point payloads.
-
-    Call this before memory_by_date when the expected answer could be
-    \"nothing from that far back\" — a zero count is a fast no-go that
-    avoids the LLM hallucinating from low-confidence fallback data.
-    Also surfaces the split between real event_timestamps and ingestion
-    fallbacks so callers can calibrate confidence.
-    """
+@registry.tool(
+    name="memory_coverage",
+    description=(
+        "Exact count of memory points in a date range, split by "
+        "real-event-timestamp vs ingestion-fallback. Call this "
+        "first when you suspect \"there might be nothing from that "
+        "date\" — a zero totals.total means the corpus genuinely "
+        "has no data for the range, so don't hallucinate an answer. "
+        "Cheap (no payload fetch, just indexed count)."
+    ),
+    schema=MemoryCoverageArgs.model_json_schema(),
+)
+async def _tool_memory_coverage(**kwargs: Any) -> dict[str, Any]:
+    args = MemoryCoverageArgs(**kwargs)
     totals: dict[str, int] = {"event": 0, "ingestion_fallback": 0, "total": 0}
     by_col: dict[str, dict[str, int]] = {}
     errors: dict[str, str] = {}
     for col in args.collections:
         try:
-            c = _count_in_range(col, args.event_after, args.event_before)
+            c = await _count_in_range(col, args.event_after, args.event_before)
             by_col[col] = c
             for k, v in c.items():
                 totals[k] = totals.get(k, 0) + v
@@ -753,146 +854,21 @@ def _tool_memory_coverage(args: MemoryCoverageArgs) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Tool registry
+# Mount MCP routes (GET /tools, POST /tools/{name}/call)
 # ---------------------------------------------------------------------------
 
-TOOLS: dict[str, dict[str, Any]] = {
-    "retrieval_debug": {
-        "description": (
-            "Replay a query through skynet-identity with debug=True and "
-            "return a pruned view of per-candidate score components "
-            "(vec, access, recency, graph, logical_decay, compression_boost, "
-            "clique_boost, ...). Use this whenever a user reports "
-            "\"Skynet doesn't remember X\" or \"the reply referenced the "
-            "wrong memory\". Answers the question: why did this candidate "
-            "win/lose? Returns top 3 per bucket (episodic, knowledge, raw) "
-            "plus a one-paragraph diagnosis."
-        ),
-        "model": RetrievalDebugArgs,
-        "fn": _tool_retrieval_debug,
-    },
-    "list_compression_stats": {
-        "description": (
-            "Return a compact summary of memory compression health for a "
-            "Qdrant collection: compression_level histogram (are we "
-            "consolidating enough?) + cliques under eviction pressure. "
-            "Use this when asking \"is memory healthy?\" or before "
-            "triggering a manual consolidation DAG."
-        ),
-        "model": ListCompressionStatsArgs,
-        "fn": _tool_list_compression_stats,
-    },
-    "memory_by_date": {
-        "description": (
-            "Retrieve memory points whose event_timestamp falls in a "
-            "date range, newest first. Use this for \"що було 15 "
-            "березня?\", \"що я робив минулого тижня?\", \"мої коміти "
-            "за квітень\" — any question where the user anchors on a "
-            "specific time, not a topic. Parse the natural-language date "
-            "YOURSELF (current date is in your system context) and pass "
-            "ISO-8601 strings. Returns only points that are actually "
-            "dated — see is_ingestion_timestamp on each result to tell "
-            "\"known to have happened then\" from \"known to have been "
-            "imported then\"."
-        ),
-        "model": MemoryByDateArgs,
-        "fn": _tool_memory_by_date,
-    },
-    "memory_recent": {
-        "description": (
-            "Return the N most recent memory points across dated "
-            "collections. Use for \"що я останнім часом робив?\", "
-            "\"останні події\", or to check the freshness of the corpus "
-            "before answering a recency-sensitive question."
-        ),
-        "model": MemoryRecentArgs,
-        "fn": _tool_memory_recent,
-    },
-    "memory_first": {
-        "description": (
-            "Return the N oldest memory points across dated collections. "
-            "Use for \"з чого все починалось?\" or to spot-check how "
-            "far back the imported history actually reaches."
-        ),
-        "model": MemoryFirstArgs,
-        "fn": _tool_memory_first,
-    },
-    "memory_coverage": {
-        "description": (
-            "Exact count of memory points in a date range, split by "
-            "real-event-timestamp vs ingestion-fallback. Call this "
-            "first when you suspect \"there might be nothing from that "
-            "date\" — a zero totals.total means the corpus genuinely "
-            "has no data for the range, so don't hallucinate an answer. "
-            "Cheap (no payload fetch, just indexed count)."
-        ),
-        "model": MemoryCoverageArgs,
-        "fn": _tool_memory_coverage,
-    },
-}
+mount_mcp(app, registry)
 
 
-def _tool_manifest() -> dict[str, Any]:
-    tools = []
-    for name, spec in TOOLS.items():
-        model: type[BaseModel] = spec["model"]
-        tools.append(
-            {
-                "name": name,
-                "description": spec["description"],
-                "inputSchema": model.model_json_schema(),
-            }
-        )
-    return {"tools": tools}
-
-
-@app.get("/tools")
-def list_tools() -> dict[str, Any]:
-    return _tool_manifest()
-
-
-class ToolCallRequest(BaseModel):
-    arguments: dict[str, Any] = Field(default_factory=dict)
-
-
-@app.post("/tools/{name}/call")
-def call_tool(name: str, req: ToolCallRequest) -> dict[str, Any]:
-    spec = TOOLS.get(name)
-    if spec is None:
-        raise HTTPException(status_code=404, detail=f"unknown tool: {name}")
-    model: type[BaseModel] = spec["model"]
-    try:
-        parsed = model(**(req.arguments or {}))
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=422, detail=f"invalid arguments: {e}") from e
-    with tracer.start_as_current_span(f"tool_{name}") as span:
-        span.set_attribute("tool.name", name)
-        if hasattr(parsed, "query"):
-            span.set_attribute("tool.query", str(parsed.query)[:200])
-        if hasattr(parsed, "collection"):
-            span.set_attribute("tool.collection", parsed.collection)
-        try:
-            result = spec["fn"](parsed)
-            return {"result": result}
-        except httpx.HTTPStatusError as e:
-            span.record_exception(e)
-            log.warning("upstream error for %s: %s", name, e.response.text[:500])
-            raise HTTPException(
-                status_code=502,
-                detail=f"upstream {e.response.status_code}: {e.response.text[:200]}",
-            ) from e
-        except Exception as e:  # noqa: BLE001
-            span.record_exception(e)
-            log.exception("tool %s failed", name)
-            raise HTTPException(status_code=500, detail=str(e)) from e
-
-
+# ---------------------------------------------------------------------------
 # Convenience endpoints for curl debugging.
+# ---------------------------------------------------------------------------
+
 @app.post("/retrieval_debug")
 def ep_retrieval_debug(args: RetrievalDebugArgs) -> dict[str, Any]:
-    return {"result": _tool_retrieval_debug(args)}
+    return {"result": _tool_retrieval_debug(**args.model_dump())}
 
 
 @app.get("/compression_stats")
 def ep_compression_stats(collection: str = "user_profile_raw") -> dict[str, Any]:
-    return {"result": _tool_list_compression_stats(ListCompressionStatsArgs(collection=collection))}
+    return {"result": _tool_list_compression_stats(collection=collection)}
