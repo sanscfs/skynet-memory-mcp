@@ -37,6 +37,7 @@ from pydantic import BaseModel, Field
 from skynet_core.logging import setup_logging
 from skynet_core.tracing import setup_tracing
 from skynet_mcp import ToolRegistry, mount_mcp
+from skynet_qdrant import AsyncQdrantClient
 
 log = setup_logging("memory-mcp")
 
@@ -70,7 +71,7 @@ registry = ToolRegistry()
 
 _identity_client: httpx.Client | None = None
 _atlas_client: httpx.Client | None = None
-_qdrant_client: httpx.Client | None = None
+_qdrant_client: AsyncQdrantClient | None = None
 
 
 def _identity() -> httpx.Client:
@@ -87,10 +88,16 @@ def _atlas() -> httpx.Client:
     return _atlas_client
 
 
-def _qdrant() -> httpx.Client:
+def _qdrant() -> AsyncQdrantClient:
+    """Lazily-instantiated shared Qdrant client.
+
+    Temporal tools use :meth:`AsyncQdrantClient.scroll` / ``count`` (via
+    ``skynet_qdrant``) for everything they need. The lib gives us an
+    httpx.AsyncClient underneath pooled across calls.
+    """
     global _qdrant_client
     if _qdrant_client is None:
-        _qdrant_client = httpx.Client(base_url=QDRANT_URL, timeout=REQUEST_TIMEOUT)
+        _qdrant_client = AsyncQdrantClient(url=QDRANT_URL, timeout=REQUEST_TIMEOUT)
     return _qdrant_client
 
 
@@ -401,7 +408,7 @@ def _tool_list_compression_stats(**kwargs: Any) -> dict[str, Any]:
 # parsing — that's why event_timestamp is stored as a string everywhere.
 
 
-def _scroll_temporal(
+async def _scroll_temporal(
     collection: str,
     event_after: Optional[str],
     event_before: Optional[str],
@@ -444,22 +451,22 @@ def _scroll_temporal(
             rng["lte"] = event_before
         return {"key": field, "range": rng}
 
+    client = _qdrant()
     seen_ids: set[str] = set()
 
     # Pass 1: real event_timestamp — highest confidence.
     if event_after or event_before:
-        body: dict[str, Any] = {
-            "limit": limit,
-            "with_payload": True,
-            "with_vector": False,
-            "filter": {
+        points, _ = await client.scroll(
+            collection,
+            limit=limit,
+            filter={
                 "must": base_must + [_range_clause("event_timestamp")],
                 "must_not": base_must_not,
             },
-        }
-        r = _qdrant().post(f"/collections/{collection}/points/scroll", json=body)
-        r.raise_for_status()
-        for p in r.json().get("result", {}).get("points", []) or []:
+            with_payload=True,
+            with_vector=False,
+        )
+        for p in points:
             pid = str(p.get("id"))
             if pid in seen_ids:
                 continue
@@ -482,21 +489,20 @@ def _scroll_temporal(
         # pipeline pre-fix). Limit the extra rows so a date-range query
         # doesn't get flooded with low-confidence gemini imports.
         if len(out) < limit:
-            body = {
-                "limit": limit - len(out),
-                "with_payload": True,
-                "with_vector": False,
-                "filter": {
+            points, _ = await client.scroll(
+                collection,
+                limit=limit - len(out),
+                filter={
                     "must": base_must + [
                         _range_clause("timestamp"),
                         {"is_empty": {"key": "event_timestamp"}},
                     ],
                     "must_not": base_must_not,
                 },
-            }
-            r = _qdrant().post(f"/collections/{collection}/points/scroll", json=body)
-            r.raise_for_status()
-            for p in r.json().get("result", {}).get("points", []) or []:
+                with_payload=True,
+                with_vector=False,
+            )
+            for p in points:
                 pid = str(p.get("id"))
                 if pid in seen_ids:
                     continue
@@ -517,20 +523,19 @@ def _scroll_temporal(
         # limit ordered-by-index (Qdrant doesn't sort, but scroll order
         # is stable-per-collection so the caller can scan until limit
         # and the result is still deterministic).
-        body = {
-            "limit": limit,
-            "with_payload": True,
-            "with_vector": False,
-            "filter": {
+        points, _ = await client.scroll(
+            collection,
+            limit=limit,
+            filter={
                 "must": base_must + [
                     {"key": "event_timestamp", "range": {"gte": "1970-01-01T00:00:00Z"}},
                 ],
                 "must_not": base_must_not,
             },
-        }
-        r = _qdrant().post(f"/collections/{collection}/points/scroll", json=body)
-        r.raise_for_status()
-        for p in r.json().get("result", {}).get("points", []) or []:
+            with_payload=True,
+            with_vector=False,
+        )
+        for p in points:
             pl = p.get("payload") or {}
             text = pl.get("text") or pl.get("action") or pl.get("summary") or ""
             out.append({
@@ -546,7 +551,9 @@ def _scroll_temporal(
     return out
 
 
-def _count_in_range(collection: str, event_after: Optional[str], event_before: Optional[str]) -> dict[str, int]:
+async def _count_in_range(
+    collection: str, event_after: Optional[str], event_before: Optional[str]
+) -> dict[str, int]:
     """Exact count per timestamp-source (event vs ingestion) in range."""
     rng: dict[str, str] = {}
     if event_after:
@@ -554,30 +561,34 @@ def _count_in_range(collection: str, event_after: Optional[str], event_before: O
     if event_before:
         rng["lte"] = event_before
 
-    def _count(flt: dict) -> int:
-        r = _qdrant().post(
-            f"/collections/{collection}/points/count",
-            json={"filter": flt, "exact": True},
-        )
-        r.raise_for_status()
-        return int(r.json().get("result", {}).get("count", 0))
+    client = _qdrant()
 
-    by_event = _count({
-        "must": [
-            {"is_empty": {"key": "superseded_by"}},
-            {"key": "event_timestamp", "range": rng},
-        ],
-        "must_not": [{"key": "archived", "match": {"value": True}}],
-    })
-    by_ingestion = _count({
-        "must": [
-            {"is_empty": {"key": "superseded_by"}},
-            {"is_empty": {"key": "event_timestamp"}},
-            {"key": "timestamp", "range": rng},
-        ],
-        "must_not": [{"key": "archived", "match": {"value": True}}],
-    })
-    return {"event": by_event, "ingestion_fallback": by_ingestion, "total": by_event + by_ingestion}
+    by_event = await client.count(
+        collection,
+        filter={
+            "must": [
+                {"is_empty": {"key": "superseded_by"}},
+                {"key": "event_timestamp", "range": rng},
+            ],
+            "must_not": [{"key": "archived", "match": {"value": True}}],
+        },
+    )
+    by_ingestion = await client.count(
+        collection,
+        filter={
+            "must": [
+                {"is_empty": {"key": "superseded_by"}},
+                {"is_empty": {"key": "event_timestamp"}},
+                {"key": "timestamp", "range": rng},
+            ],
+            "must_not": [{"key": "archived", "match": {"value": True}}],
+        },
+    )
+    return {
+        "event": by_event,
+        "ingestion_fallback": by_ingestion,
+        "total": by_event + by_ingestion,
+    }
 
 
 class MemoryByDateArgs(BaseModel):
@@ -634,7 +645,7 @@ class MemoryByDateArgs(BaseModel):
     ),
     schema=MemoryByDateArgs.model_json_schema(),
 )
-def _tool_memory_by_date(**kwargs: Any) -> dict[str, Any]:
+async def _tool_memory_by_date(**kwargs: Any) -> dict[str, Any]:
     args = MemoryByDateArgs(**kwargs)
     if not args.event_after and not args.event_before:
         return {
@@ -652,8 +663,14 @@ def _tool_memory_by_date(**kwargs: Any) -> dict[str, Any]:
     counts: dict[str, dict[str, int]] = {}
     for col in args.collections:
         try:
-            merged.extend(_scroll_temporal(col, args.event_after, args.event_before, limit=args.limit))
-            counts[col] = _count_in_range(col, args.event_after, args.event_before)
+            merged.extend(
+                await _scroll_temporal(
+                    col, args.event_after, args.event_before, limit=args.limit
+                )
+            )
+            counts[col] = await _count_in_range(
+                col, args.event_after, args.event_before
+            )
         except httpx.HTTPError as e:
             errors[col] = str(e)[:200]
 
@@ -705,7 +722,7 @@ class MemoryRecentArgs(BaseModel):
     ),
     schema=MemoryRecentArgs.model_json_schema(),
 )
-def _tool_memory_recent(**kwargs: Any) -> dict[str, Any]:
+async def _tool_memory_recent(**kwargs: Any) -> dict[str, Any]:
     args = MemoryRecentArgs(**kwargs)
     merged: list[dict] = []
     errors: dict[str, str] = {}
@@ -715,7 +732,7 @@ def _tool_memory_recent(**kwargs: Any) -> dict[str, Any]:
     fetch = max(args.n * 3, args.n)
     for col in args.collections:
         try:
-            merged.extend(_scroll_temporal(col, None, None, limit=fetch))
+            merged.extend(await _scroll_temporal(col, None, None, limit=fetch))
         except httpx.HTTPError as e:
             errors[col] = str(e)[:200]
     merged.sort(key=lambda p: p["event_timestamp"] or "", reverse=True)
@@ -747,14 +764,14 @@ class MemoryFirstArgs(BaseModel):
     ),
     schema=MemoryFirstArgs.model_json_schema(),
 )
-def _tool_memory_first(**kwargs: Any) -> dict[str, Any]:
+async def _tool_memory_first(**kwargs: Any) -> dict[str, Any]:
     args = MemoryFirstArgs(**kwargs)
     merged: list[dict] = []
     errors: dict[str, str] = {}
     fetch = max(args.n * 3, args.n)
     for col in args.collections:
         try:
-            merged.extend(_scroll_temporal(col, None, None, limit=fetch))
+            merged.extend(await _scroll_temporal(col, None, None, limit=fetch))
         except httpx.HTTPError as e:
             errors[col] = str(e)[:200]
     merged.sort(key=lambda p: p["event_timestamp"] or "")
@@ -792,14 +809,14 @@ class MemoryCoverageArgs(BaseModel):
     ),
     schema=MemoryCoverageArgs.model_json_schema(),
 )
-def _tool_memory_coverage(**kwargs: Any) -> dict[str, Any]:
+async def _tool_memory_coverage(**kwargs: Any) -> dict[str, Any]:
     args = MemoryCoverageArgs(**kwargs)
     totals: dict[str, int] = {"event": 0, "ingestion_fallback": 0, "total": 0}
     by_col: dict[str, dict[str, int]] = {}
     errors: dict[str, str] = {}
     for col in args.collections:
         try:
-            c = _count_in_range(col, args.event_after, args.event_before)
+            c = await _count_in_range(col, args.event_after, args.event_before)
             by_col[col] = c
             for k, v in c.items():
                 totals[k] = totals.get(k, 0) + v
@@ -827,6 +844,16 @@ def _tool_memory_coverage(**kwargs: Any) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 mount_mcp(app, registry)
+
+
+@app.on_event("shutdown")
+async def _close_qdrant() -> None:
+    """Cleanly close the shared AsyncQdrantClient on shutdown to avoid
+    'Unclosed client session' warnings in logs."""
+    global _qdrant_client
+    if _qdrant_client is not None:
+        await _qdrant_client.close()
+        _qdrant_client = None
 
 
 # ---------------------------------------------------------------------------
