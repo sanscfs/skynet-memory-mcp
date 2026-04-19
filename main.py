@@ -59,8 +59,8 @@ MAX_ITEMS_PER_BUCKET = int(os.getenv("MAX_ITEMS_PER_BUCKET", "3"))
 # Collections the temporal tools see by default. user_profile_raw holds
 # imported data (gemini, phone, git history, claude sessions) — where
 # date-anchored questions usually find their answer. skynet_episodic
-# holds live Matrix/task memory. skynet_knowledge is excluded because
-# it's deprecated (see project_skynet_knowledge_deleted.md).
+# holds live Matrix/task memory. The legacy skynet_knowledge collection
+# was removed 2026-04-19 — it had been empty since Phase 0.
 DEFAULT_TEMPORAL_COLLECTIONS = ["user_profile_raw", "skynet_episodic"]
 # Hard cap on points returned per tool call — temporal queries can easily
 # page through thousands of points, and LLM context isn't cheap. Tune
@@ -331,9 +331,8 @@ class ListCompressionStatsArgs(BaseModel):
         "user_profile_raw",
         description=(
             "Qdrant collection name. Defaults to user_profile_raw "
-            "(what end-user memory lives in). Other options: "
-            "skynet_episodic, skynet_knowledge (likely empty — see "
-            "memory/project_skynet_knowledge_deleted.md)."
+            "(what end-user memory lives in). Other option: "
+            "skynet_episodic (live Matrix/task memory)."
         ),
     )
 
