@@ -29,7 +29,8 @@ Environment variables:
 from __future__ import annotations
 
 import os
-from typing import Any, Optional
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator, Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException
@@ -66,7 +67,20 @@ DEFAULT_TEMPORAL_COLLECTIONS = ["user_profile_raw", "skynet_episodic"]
 # via env if a caller legitimately needs more.
 TEMPORAL_MAX_RESULTS = int(os.getenv("TEMPORAL_MAX_RESULTS", "50"))
 
-app = FastAPI(title="skynet-memory-mcp", version="0.1.0")
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Close the shared AsyncQdrantClient on shutdown to avoid
+    'Unclosed client session' warnings in logs."""
+    try:
+        yield
+    finally:
+        global _qdrant_client
+        if _qdrant_client is not None:
+            await _qdrant_client.close()
+            _qdrant_client = None
+
+
+app = FastAPI(title="skynet-memory-mcp", version="0.1.0", lifespan=lifespan)
 registry = ToolRegistry()
 
 _identity_client: httpx.Client | None = None
@@ -844,16 +858,6 @@ async def _tool_memory_coverage(**kwargs: Any) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 mount_mcp(app, registry)
-
-
-@app.on_event("shutdown")
-async def _close_qdrant() -> None:
-    """Cleanly close the shared AsyncQdrantClient on shutdown to avoid
-    'Unclosed client session' warnings in logs."""
-    global _qdrant_client
-    if _qdrant_client is not None:
-        await _qdrant_client.close()
-        _qdrant_client = None
 
 
 # ---------------------------------------------------------------------------
